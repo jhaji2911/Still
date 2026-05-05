@@ -39,4 +39,7 @@ data class ContextToken(
     val devicePlace: DevicePlace,
     val peripheral: Peripheral,
     val heartRateBpm: Int? = null,
+    val isDeviceLocked: Boolean = false,
+    val isCharging: Boolean = false,
+    val sessionSteps: Int = 0,
 )

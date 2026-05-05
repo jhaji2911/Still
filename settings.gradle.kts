@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Still"
-include(":app", ":core")
+include(":app", ":core", ":aicore")

@@ -2,17 +2,23 @@ package com.ninjha.still
 
 import android.Manifest
 import android.app.Activity
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.BatteryManager
 import android.os.Bundle
 import android.os.SystemClock
+import android.provider.ContactsContract
+import android.telephony.SmsManager
 import android.view.Gravity
 import android.view.View
 import android.widget.FrameLayout
@@ -29,10 +35,19 @@ import com.ninjha.still.core.PhysioStress
 import com.ninjha.still.core.StillEngine
 import com.ninjha.still.core.StillState
 import java.util.Locale
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
-    private val engine = StillEngine()
+    private val deterministicEngine = StillEngine()
+    private val androidAICore = AndroidAICoreStatePredictor()
+    private val inferenceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var sensorFusion: SensorFusion
     private lateinit var contentHost: FrameLayout
     private lateinit var bottomNav: LinearLayout
@@ -40,17 +55,32 @@ class MainActivity : Activity() {
 
     private var currentScreen = Screen.Presence
     private var onboardingComplete = false
-    private var snapshot = SensorSnapshot(0f, MotionState.Still, null)
+    private var snapshot = SensorSnapshot.Empty
     private var heartRateBpm = 72
-    private var ambientAudio = EnviroDecibel.Silent
+    private var ambientAudioOverride: EnviroDecibel? = null
     private var devicePlace = DevicePlace.InHand
     private var peripheral = Peripheral.None
     private var inferencePaused = false
+    private var smsChannelEnabled = false
+    private var selectedContactName: String? = null
+    private var selectedContactPhone: String? = null
+    private var lastSentStateLabel: String? = null
+    private var lastSmsSentAt = 0L
     private var lastSensorRenderAt = 0L
     private var lastNotificationAt = 0L
     private var lastNotificationLabel: String? = null
     private var lastLoggedLabel: String? = null
     private var lastLoggedAt = 0L
+    private var currentState: StillState? = null
+    private var currentStateToken: ContextToken? = null
+    private var inferenceJob: Job? = null
+    private var lastAICorePredictedToken: ContextToken? = null
+    private var lastAICoreRequestAt = 0L
+    private var sensorsScrollY = 0
+    private val screenScrollY = mutableMapOf<Screen, Int>()
+    private var renderedScreen: Screen? = null
+    private var renderedBottomNavScreen: Screen? = null
+    private var sensorsRefs: SensorsRefs? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,10 +99,11 @@ class MainActivity : Activity() {
 
             if (shouldRender) {
                 lastSensorRenderAt = now
-                contentHost.post { renderScreen() }
+                contentHost.post { refreshInference() }
             }
         }
         setContentView(buildShell())
+        refreshInference()
         renderScreen()
     }
 
@@ -86,10 +117,17 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
+    override fun onDestroy() {
+        inferenceScope.cancel()
+        super.onDestroy()
+    }
+
     private fun requestSensorPermissions() {
         val requested = mutableListOf(
             Manifest.permission.ACTIVITY_RECOGNITION,
             Manifest.permission.BODY_SENSORS,
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.SEND_SMS,
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             requested += Manifest.permission.POST_NOTIFICATIONS
@@ -100,6 +138,25 @@ class MainActivity : Activity() {
         if (permissions.isNotEmpty()) {
             requestPermissions(permissions.toTypedArray(), 1001)
         }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != CONTACT_PICK_REQUEST || resultCode != RESULT_OK) return
+
+        val contactUri = data?.data ?: return
+        val projection = arrayOf(
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+            ContactsContract.CommonDataKinds.Phone.NUMBER,
+        )
+        contentResolver.query(contactUri, projection, null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                selectedContactName = cursor.getString(0)
+                selectedContactPhone = cursor.getString(1)
+                lastSentStateLabel = null
+            }
+        }
+        if (currentScreen == Screen.Channels) renderScreen()
     }
 
     private fun buildShell(): View {
@@ -176,43 +233,49 @@ class MainActivity : Activity() {
     private fun renderScreen() {
         if (!::contentHost.isInitialized) return
 
-        val token = currentToken()
+        rememberCurrentScroll()
+
         val state = if (inferencePaused) {
-            StillState(
-                label = "Paused",
-                confidence = 1f,
-                estimatedReturnMinutes = 60,
-                autoReply = "Nishant has paused automatic context inference. He'll reply when ready.",
-                reasons = listOf("manual pause enabled"),
-            )
+            pausedState()
         } else {
-            engine.infer(token)
+            currentState ?: deterministicEngine.infer(currentToken()).withFallbackReason("Android AICore warming up")
         }
 
         if (onboardingComplete) {
             maybeLogState(state)
             maybePostStatusNotification(state)
+            maybeSendEphemeralStatus(state)
+        }
+
+        if (onboardingComplete && currentScreen == Screen.Sensors && renderedScreen == Screen.Sensors) {
+            updateSensorsScreen(currentToken(), state)
+            return
         }
 
         contentHost.removeAllViews()
+        val nextScreen = if (onboardingComplete) {
+            when (currentScreen) {
+                Screen.Presence -> presenceScreen(state)
+                Screen.Sensors -> sensorsScreen(currentToken(), state)
+                Screen.Insights -> insightsScreen()
+                Screen.Channels -> channelsScreen(state)
+                Screen.Privacy -> privacyScreen()
+            }
+        } else {
+            onboardingScreen()
+        }
         contentHost.addView(
-            if (onboardingComplete) {
-                when (currentScreen) {
-                    Screen.Presence -> presenceScreen(state)
-                    Screen.Sensors -> sensorsScreen(token, state)
-                    Screen.Insights -> insightsScreen()
-                    Screen.Privacy -> privacyScreen()
-                }
-            } else {
-                onboardingScreen()
-            },
+            nextScreen,
         )
+        renderedScreen = if (onboardingComplete) currentScreen else null
+        restoreCurrentScroll()
 
         if (onboardingComplete) {
             bottomNav.visibility = View.VISIBLE
-            renderBottomNav()
+            if (renderedBottomNavScreen != currentScreen) renderBottomNav()
         } else {
             bottomNav.visibility = View.GONE
+            renderedBottomNavScreen = null
         }
     }
 
@@ -222,7 +285,92 @@ class MainActivity : Activity() {
             val selected = screen == currentScreen
             bottomNav.addView(navItem(screen, selected), LinearLayout.LayoutParams(0, dp(62), 1f))
         }
+        renderedBottomNavScreen = currentScreen
     }
+
+    private fun refreshInference() {
+        val token = currentToken()
+        currentStateToken = token
+        val now = SystemClock.elapsedRealtime()
+
+        if (inferencePaused) {
+            currentState = pausedState()
+            renderScreen()
+            return
+        }
+
+        currentState = deterministicEngine
+            .infer(token)
+            .withFallbackReason(
+                if (inferenceJob?.isActive == true) {
+                    "Live sensor inference; Android AICore running in background"
+                } else {
+                    "Live sensor inference"
+                },
+            )
+
+        val shouldStartAICore =
+            onboardingComplete &&
+                inferenceJob?.isActive != true &&
+                token != lastAICorePredictedToken &&
+                now - lastAICoreRequestAt >= AICORE_INFERENCE_INTERVAL_MS
+
+        if (!shouldStartAICore) {
+            renderScreen()
+            return
+        }
+
+        lastAICoreRequestAt = now
+        inferenceJob = inferenceScope.launch {
+            val prediction = runCatching { withContext(Dispatchers.IO) { androidAICore.predict(token) } }
+            val predicted = prediction.getOrElse { error ->
+                    deterministicEngine
+                        .infer(token)
+                        .withFallbackReason("Android AICore retry later: ${error.message ?: error::class.java.simpleName}")
+                }
+            if (prediction.isSuccess) {
+                lastAICorePredictedToken = token
+            }
+
+            if (currentStateToken == token && !inferencePaused) {
+                val liveState = deterministicEngine.infer(token)
+                currentState = if (prediction.isSuccess && predicted.label == liveState.label) {
+                    predicted
+                } else {
+                    liveState.withFallbackReason("Live sensor inference; Android AICore disagreed")
+                }
+                renderScreen()
+            }
+        }
+    }
+
+    private fun rememberCurrentScroll() {
+        val screen = renderedScreen ?: return
+        val scrollY = (contentHost.getChildAt(0) as? ScrollView)?.scrollY ?: return
+        screenScrollY[screen] = scrollY
+        if (screen == Screen.Sensors) sensorsScrollY = scrollY
+    }
+
+    private fun restoreCurrentScroll() {
+        val targetY = screenScrollY[currentScreen] ?: 0
+        val restore = Runnable {
+            (contentHost.getChildAt(0) as? ScrollView)?.scrollTo(0, targetY)
+        }
+        (contentHost.getChildAt(0) as? ScrollView)?.post(restore)
+        contentHost.postDelayed(restore, 50L)
+        contentHost.postDelayed(restore, 150L)
+    }
+
+    private fun pausedState(): StillState = StillState(
+        label = "Paused",
+        confidence = 1f,
+        estimatedReturnMinutes = 60,
+        autoReply = "Nishant has paused automatic context inference. He'll reply when ready.",
+        reasons = listOf("manual pause enabled"),
+    )
+
+    private fun StillState.withFallbackReason(reason: String): StillState =
+        copy(reasons = listOf(reason) + reasons)
 
     private fun navItem(screen: Screen, selected: Boolean): View =
         LinearLayout(this).apply {
@@ -232,6 +380,7 @@ class MainActivity : Activity() {
             isClickable = true
             isFocusable = true
             setOnClickListener {
+                rememberCurrentScroll()
                 currentScreen = screen
                 renderScreen()
             }
@@ -275,7 +424,7 @@ class MainActivity : Activity() {
                 prefs.edit().putBoolean(KEY_ONBOARDING_COMPLETE, true).apply()
                 requestSensorPermissions()
                 currentScreen = Screen.Presence
-                renderScreen()
+                refreshInference()
             }
         })
         addView(actionWide("Read Manifesto").apply {
@@ -359,25 +508,29 @@ class MainActivity : Activity() {
 
         addView(actionButton(if (inferencePaused) "Resume" else "Pause") {
             inferencePaused = !inferencePaused
-            renderScreen()
+            refreshInference()
         })
     }
 
-    private fun sensorsScreen(token: ContextToken, state: StillState): View = page {
+    private fun sensorsScreen(token: ContextToken, state: StillState): View = page(restoreSensorsScroll = true) {
+        val refs = SensorsRefs()
         addView(headline("Sensor Tokens", "Manual controls let v1 simulate signals that need wearable or notification integrations later."))
         addView(card {
             addView(label("LIVE TOKEN BUFFER", StillColor.Variant))
-            addView(tokenRow("Motion", token.motion.name, "Accel ${format(snapshot.accelerationMagnitude)} m/s2"))
-            addView(tokenRow("Heart", "${heartRateBpm} bpm", token.physioStress.name))
-            addView(tokenRow("Audio", token.ambientAudio.name, "manual v1 token"))
-            addView(tokenRow("Place", token.devicePlace.name, "manual v1 token"))
-            addView(tokenRow("Peripheral", token.peripheral.name, "manual v1 token"))
+            refs.motion = addDynamicRow("Motion")
+            refs.heart = addDynamicRow("Heart")
+            refs.audio = addDynamicRow("Audio")
+            refs.place = addDynamicRow("Place")
+            refs.peripheral = addDynamicRow("Peripheral")
+            refs.phone = addDynamicRow("Phone")
         })
+        addView(computeCard(refs))
 
         addView(controlGroup("Ambient Audio",
-            choice("Silent", ambientAudio == EnviroDecibel.Silent) { ambientAudio = EnviroDecibel.Silent },
-            choice("Rhythmic", ambientAudio == EnviroDecibel.Rhythmic) { ambientAudio = EnviroDecibel.Rhythmic },
-            choice("Chaotic", ambientAudio == EnviroDecibel.Chaotic) { ambientAudio = EnviroDecibel.Chaotic },
+            choice("Auto", ambientAudioOverride == null) { ambientAudioOverride = null },
+            choice("Silent", ambientAudioOverride == EnviroDecibel.Silent) { ambientAudioOverride = EnviroDecibel.Silent },
+            choice("Rhythmic", ambientAudioOverride == EnviroDecibel.Rhythmic) { ambientAudioOverride = EnviroDecibel.Rhythmic },
+            choice("Chaotic", ambientAudioOverride == EnviroDecibel.Chaotic) { ambientAudioOverride = EnviroDecibel.Chaotic },
         ))
         addView(controlGroup("Device Place",
             choice("In hand", devicePlace == DevicePlace.InHand) { devicePlace = DevicePlace.InHand },
@@ -396,8 +549,57 @@ class MainActivity : Activity() {
         ))
         addView(card(backgroundColor = StillColor.TertiaryContainer) {
             addView(label("CURRENT READ", StillColor.TertiaryText))
-            addView(body("${state.label}: ${state.reasons.joinToString(", ")}", 16f, StillColor.TertiaryText))
+            refs.currentRead = body("", 16f, StillColor.TertiaryText)
+            addView(refs.currentRead)
         })
+        sensorsRefs = refs
+        updateSensorsScreen(token, state)
+    }
+
+    private fun LinearLayout.addDynamicRow(title: String): SensorRowRefs {
+        val row = dynamicTokenRow(title)
+        addView(row.view)
+        return row
+    }
+
+    private fun updateSensorsScreen(token: ContextToken, state: StillState) {
+        val refs = sensorsRefs ?: return
+        refs.motion?.update(token.motion.name, "Accel ${format(snapshot.accelerationMagnitude)} m/s2, gyro ${format(snapshot.angularSpeedRadPerSec)} rad/s")
+        refs.heart?.update("${heartRateBpm} bpm", token.physioStress.name)
+        refs.audio?.update(
+            token.ambientAudio.name,
+            ambientAudioDetail(token),
+        )
+        refs.place?.update(token.devicePlace.name, snapshot.sensorDevicePlace?.let { "sensor-derived from gravity/light" } ?: "manual v1 token")
+        refs.peripheral?.update(token.peripheral.name, "manual v1 token")
+        refs.phone?.update(phoneStateLabel(token), "lock and charging state")
+        refs.sensors?.update(sensorAvailability(), "registered hardware feeds")
+        refs.steps?.update("${snapshot.sessionSteps}", "pedometer session steps")
+        refs.accelerometer?.update(
+            "${format(snapshot.accelerationMagnitude)} m/s2",
+            "vector ${snapshot.acceleration.formatVector()}, delta g ${format(snapshot.accelerationDeltaFromGravity)}",
+        )
+        refs.gyroscope?.update(
+            "${format(snapshot.angularSpeedRadPerSec)} rad/s",
+            "vector ${snapshot.gyroscope.formatVector()}",
+        )
+        refs.gravity?.update(
+            snapshot.gravityOrientation,
+            "vector ${snapshot.gravity.formatVector()}, mag ${format(snapshot.gravityMagnitude)}",
+        )
+        refs.light?.update(
+            snapshot.lightLux?.let { "${format(it)} lux" } ?: "unknown",
+            "used with gravity to infer pocket/face-down/stand",
+        )
+        refs.fused?.update(
+            token.motion.name,
+            "place ${token.devicePlace.name}, stress ${token.physioStress.name}, ${phoneStateLabel(token)}",
+        )
+        refs.compute?.update(
+            state.label,
+            state.reasons.joinToString(" + "),
+        )
+        refs.currentRead?.text = "${state.label}: ${state.reasons.joinToString(", ")}"
     }
 
     private fun insightsScreen(): View = page {
@@ -462,6 +664,41 @@ class MainActivity : Activity() {
             addView(text(duration, 14f, StillColor.Ink, Typeface.BOLD))
         }
 
+    private fun channelsScreen(state: StillState): View = page {
+        addView(headline("Channels", "Send the current status through local device channels. Contact and message state are kept in memory only."))
+        addView(card {
+            addView(label("SMS CHANNEL", StillColor.Variant))
+            addView(tokenRow("Contact", selectedContactName ?: "None", selectedContactPhone ?: "Pick a contact to enable sending"))
+            addView(tokenRow("Mode", if (smsChannelEnabled) "Auto" else "Off", "ephemeral send on state changes"))
+            addView(actionWide("Pick Contact").apply {
+                setOnClickListener { pickSmsContact() }
+            })
+            addView(actionWide(if (smsChannelEnabled) "Disable Auto SMS" else "Enable Auto SMS").apply {
+                setOnClickListener {
+                    smsChannelEnabled = !smsChannelEnabled
+                    lastSentStateLabel = null
+                    renderScreen()
+                }
+            })
+            addView(actionWide("Send Current Status").apply {
+                setOnClickListener {
+                    sendStatusSms(state, force = true)
+                    renderScreen()
+                }
+            })
+        })
+        addView(card(backgroundColor = StillColor.SurfaceContainerLow) {
+            addView(label("MESSAGE PREVIEW", StillColor.Variant))
+            addView(body(statusMessage(state), 16f, StillColor.Variant))
+        })
+    }
+
+    private fun pickSmsContact() {
+        requestSensorPermissions()
+        val intent = Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI)
+        startActivityForResult(intent, CONTACT_PICK_REQUEST)
+    }
+
     private fun privacyScreen(): View = page {
         addView(headline("Transparency", "Your physical space is translated entirely on-device. Manage how your presence is interpreted."))
         addView(card(backgroundColor = StillColor.TertiaryContainer, strokeColor = StillColor.TertiaryDim) {
@@ -494,7 +731,12 @@ class MainActivity : Activity() {
             "Shows current inferred state as a public notification.",
             canPostNotifications(),
         ) { requestSensorPermissions() })
-        addView(permissionRow("Audio Tokens", "V1 uses manual audio tokens. Raw audio is never recorded.", false))
+        addView(permissionRow("Audio Tokens", "No microphone access. Ambient token is inferred from motion, light, steps, and manual override.", true))
+        addView(permissionRow(
+            "SMS Channel",
+            "Lets Still send ephemeral status messages to a selected contact.",
+            hasPermission(Manifest.permission.SEND_SMS),
+        ) { requestSensorPermissions() })
         addView(actionWide("Purge All Local Logs").apply {
             setOnClickListener {
                 clearLogs()
@@ -571,6 +813,8 @@ class MainActivity : Activity() {
             description = "Current Still availability state"
             lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             setShowBadge(false)
+            enableVibration(true)
+            vibrationPattern = STILL_VIBRATION_PATTERN
         }
         manager.createNotificationChannel(channel)
     }
@@ -594,11 +838,35 @@ class MainActivity : Activity() {
             .setOngoing(false)
             .setShowWhen(true)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setVibrate(STILL_VIBRATION_PATTERN)
             .setCategory(Notification.CATEGORY_STATUS)
             .build()
 
         manager.notify(STATUS_NOTIFICATION_ID, notification)
     }
+
+    private fun maybeSendEphemeralStatus(state: StillState) {
+        if (!smsChannelEnabled) return
+        if (state.label == lastSentStateLabel) return
+        if (SystemClock.elapsedRealtime() - lastSmsSentAt < SMS_SEND_INTERVAL_MS) return
+        sendStatusSms(state, force = false)
+    }
+
+    private fun sendStatusSms(state: StillState, force: Boolean) {
+        val phone = selectedContactPhone ?: return
+        if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
+            requestSensorPermissions()
+            return
+        }
+        if (!force && !smsChannelEnabled) return
+
+        SmsManager.getDefault().sendTextMessage(phone, null, statusMessage(state), null, null)
+        lastSentStateLabel = state.label
+        lastSmsSentAt = SystemClock.elapsedRealtime()
+    }
+
+    private fun statusMessage(state: StillState): String =
+        "Still: ${state.autoReply}"
 
     private fun hasPermission(permission: String): Boolean =
         checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
@@ -620,10 +888,13 @@ class MainActivity : Activity() {
     private fun currentToken(): ContextToken = ContextToken(
         motion = snapshot.motion,
         physioStress = stressFromHeartRate(heartRateBpm),
-        ambientAudio = ambientAudio,
-        devicePlace = devicePlace,
+        ambientAudio = ambientAudioOverride ?: inferredAmbientAudio(),
+        devicePlace = snapshot.sensorDevicePlace ?: devicePlace,
         peripheral = peripheral,
         heartRateBpm = heartRateBpm,
+        isDeviceLocked = isDeviceLocked(),
+        isCharging = isCharging(),
+        sessionSteps = snapshot.sessionSteps,
     )
 
     private fun stressFromHeartRate(heartRateBpm: Int): PhysioStress = when {
@@ -632,10 +903,26 @@ class MainActivity : Activity() {
         else -> PhysioStress.Resting
     }
 
-    private fun page(content: LinearLayout.() -> Unit): View =
+    private fun inferredAmbientAudio(): EnviroDecibel {
+        val lightLux = snapshot.lightLux
+        return when {
+        lightLux == null -> EnviroDecibel.Silent
+        lightLux < 2f && snapshot.motion == MotionState.Still -> EnviroDecibel.Silent
+        snapshot.sessionSteps >= 20 || snapshot.motion == MotionState.HighMotion -> EnviroDecibel.Chaotic
+        snapshot.angularSpeedRadPerSec in 0.15f..0.8f || snapshot.motion == MotionState.MicroVibration -> EnviroDecibel.Rhythmic
+        else -> EnviroDecibel.Silent
+        }
+    }
+
+    private fun page(restoreSensorsScroll: Boolean = false, content: LinearLayout.() -> Unit): View =
         ScrollView(this).apply {
             isFillViewport = false
             setBackgroundColor(StillColor.Background)
+            scrollTo(0, screenScrollY[currentScreen] ?: 0)
+            setOnScrollChangeListener { _, _, scrollY, _, _ ->
+                screenScrollY[currentScreen] = scrollY
+                if (restoreSensorsScroll) sensorsScrollY = scrollY
+            }
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(24), dp(24), dp(24), dp(30))
@@ -669,6 +956,41 @@ class MainActivity : Activity() {
             addView(statusChip(value, StillColor.Variant, StillColor.SurfaceContainer))
         }
 
+    private fun dynamicTokenRow(title: String): SensorRowRefs {
+        val valueView = statusChip("", StillColor.Variant, StillColor.SurfaceContainer)
+        val detailView = body("", 12f, StillColor.Variant)
+        val view = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, dp(10))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(text(title, 14f, StillColor.Ink, Typeface.BOLD))
+                addView(detailView)
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(valueView)
+        }
+        return SensorRowRefs(view, valueView, detailView)
+    }
+
+    private fun SensorRowRefs.update(value: String, detail: String) {
+        if (valueView.text.toString() != value) valueView.text = value
+        if (detailView.text.toString() != detail) detailView.text = detail
+    }
+
+    private fun computeCard(refs: SensorsRefs): View =
+        card(backgroundColor = StillColor.SurfaceContainerLow) {
+            addView(label("DEV COMPUTE", StillColor.Variant))
+            refs.sensors = addDynamicRow("Sensors")
+            refs.steps = addDynamicRow("Steps")
+            refs.accelerometer = addDynamicRow("Accelerometer")
+            refs.gyroscope = addDynamicRow("Gyroscope")
+            refs.gravity = addDynamicRow("Gravity")
+            refs.light = addDynamicRow("Ambient light")
+            refs.fused = addDynamicRow("Fused token")
+            refs.compute = addDynamicRow("Score path")
+        }
+
     private fun controlGroup(title: String, vararg choices: View): View =
         card {
             addView(label(title.uppercase(Locale.US), StillColor.Variant))
@@ -683,9 +1005,15 @@ class MainActivity : Activity() {
         text(label, 13f, if (selected) StillColor.White else StillColor.Variant, Typeface.BOLD).apply {
             gravity = Gravity.CENTER
             background = pill(if (selected) StillColor.Ink else StillColor.SurfaceContainer, StillColor.OutlineVariant)
+            isClickable = true
+            isFocusable = true
             setOnClickListener {
                 onSelect()
-                renderScreen()
+                if (currentScreen == Screen.Sensors) {
+                    renderedScreen = null
+                    sensorsRefs = null
+                }
+                refreshInference()
             }
         }
 
@@ -702,6 +1030,8 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             setPadding(dp(18), dp(10), dp(18), dp(10))
             background = rounded(StillColor.Primary, dp(10))
+            isClickable = true
+            isFocusable = true
             setOnClickListener { onClick() }
         }
 
@@ -710,6 +1040,8 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             setPadding(dp(18), dp(16), dp(18), dp(16))
             background = rounded(StillColor.SurfaceContainer, dp(16), StillColor.OutlineVariant, 1)
+            isClickable = true
+            isFocusable = true
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).withTop(dp(18))
         }
 
@@ -764,6 +1096,7 @@ class MainActivity : Activity() {
         "Available" -> Tone(StillColor.TertiaryContainer, StillColor.Tertiary, StillColor.TertiaryDim)
         "Training", "Deep work" -> Tone(StillColor.SecondaryContainer, StillColor.Secondary, StillColor.SecondaryDim)
         "Commuting" -> Tone(StillColor.SurfaceContainerHigh, StillColor.Primary, StillColor.OutlineVariant)
+        "Away" -> Tone(StillColor.SurfaceContainerHigh, StillColor.Variant, StillColor.OutlineVariant)
         "Paused" -> Tone(StillColor.SurfaceVariant, StillColor.Variant, StillColor.OutlineVariant)
         else -> Tone(StillColor.TertiaryContainer, StillColor.Tertiary, StillColor.TertiaryDim)
     }
@@ -773,11 +1106,40 @@ class MainActivity : Activity() {
         "Meditating" -> "Rest"
         "Commuting" -> "Ride"
         "Deep work" -> "Focus"
+        "Away" -> "Away"
         "Paused" -> "Hold"
         else -> "Open"
     }
 
     private fun format(value: Float): String = String.format(Locale.US, "%.2f", value)
+
+    private fun VectorSample.formatVector(): String =
+        "(${format(x)}, ${format(y)}, ${format(z)})"
+
+    private fun sensorAvailability(): String = listOf(
+        "accel" to snapshot.hasAccelerometer,
+        "gyro" to snapshot.hasGyroscope,
+        "gravity" to snapshot.hasGravitySensor,
+        "light" to snapshot.hasLightSensor,
+        "steps" to (snapshot.hasStepCounter || snapshot.hasStepDetector),
+    ).joinToString(" / ") { (name, available) -> "$name ${if (available) "on" else "off"}" }
+
+    private fun phoneStateLabel(token: ContextToken): String = when {
+        token.isDeviceLocked && token.isCharging -> "locked + charging"
+        token.isDeviceLocked -> "locked"
+        token.isCharging -> "charging"
+        else -> "unlocked"
+    }
+
+    private fun ambientAudioDetail(token: ContextToken): String =
+        ambientAudioOverride?.let { "manual override; no microphone permission used" }
+            ?: "inferred without mic from motion ${token.motion.name}, light ${snapshot.lightLux?.let { format(it) } ?: "unknown"} lux, steps ${snapshot.sessionSteps}"
+
+    private fun isDeviceLocked(): Boolean =
+        getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
+
+    private fun isCharging(): Boolean =
+        getSystemService(BatteryManager::class.java)?.isCharging == true
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
 
@@ -840,8 +1202,33 @@ class MainActivity : Activity() {
         Presence("Presence", "View"),
         Sensors("Sensors", "Sense"),
         Insights("Insights", "Logs"),
+        Channels("Channels", "Send"),
         Privacy("Privacy", "Lock"),
     }
+
+    private data class SensorRowRefs(
+        val view: View,
+        val valueView: TextView,
+        val detailView: TextView,
+    )
+
+    private data class SensorsRefs(
+        var motion: SensorRowRefs? = null,
+        var heart: SensorRowRefs? = null,
+        var audio: SensorRowRefs? = null,
+        var place: SensorRowRefs? = null,
+        var peripheral: SensorRowRefs? = null,
+        var phone: SensorRowRefs? = null,
+        var sensors: SensorRowRefs? = null,
+        var steps: SensorRowRefs? = null,
+        var accelerometer: SensorRowRefs? = null,
+        var gyroscope: SensorRowRefs? = null,
+        var gravity: SensorRowRefs? = null,
+        var light: SensorRowRefs? = null,
+        var fused: SensorRowRefs? = null,
+        var compute: SensorRowRefs? = null,
+        var currentRead: TextView? = null,
+    )
 }
 
 private fun String.escapeLogField(): String =
@@ -880,13 +1267,17 @@ private object StillColor {
 }
 
 private const val SENSOR_RENDER_INTERVAL_MS = 2_000L
+private const val AICORE_INFERENCE_INTERVAL_MS = 60_000L
 private const val NOTIFICATION_UPDATE_INTERVAL_MS = 30_000L
 private const val LOG_REPEAT_INTERVAL_MS = 10 * 60_000L
+private const val SMS_SEND_INTERVAL_MS = 5 * 60_000L
 private const val MAX_LOGS = 20
+private const val CONTACT_PICK_REQUEST = 2001
 private const val PREFS_NAME = "still_mvp"
 private const val KEY_ONBOARDING_COMPLETE = "onboarding_complete"
 private const val KEY_LOGS = "inference_logs"
 private const val LOG_ROW_SEPARATOR = "\u001E"
 private const val LOG_FIELD_SEPARATOR = "\u001F"
-private const val STATUS_CHANNEL_ID = "still_status"
+private const val STATUS_CHANNEL_ID = "still_status_signature_v2"
 private const val STATUS_NOTIFICATION_ID = 1001
+private val STILL_VIBRATION_PATTERN = longArrayOf(0L, 45L, 60L, 120L, 80L, 45L)

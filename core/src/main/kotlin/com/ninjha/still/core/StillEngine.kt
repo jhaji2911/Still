@@ -3,6 +3,7 @@ package com.ninjha.still.core
 class StillEngine {
     fun infer(token: ContextToken): StillState {
         val candidates = listOf(
+            scoreAway(token),
             scoreGym(token),
             scoreMeditating(token),
             scoreCommuting(token),
@@ -19,6 +20,31 @@ class StillEngine {
             estimatedReturnMinutes = best.returnMinutes,
             autoReply = "${best.intent} ${best.returnText}",
             reasons = best.reasons,
+        )
+    }
+
+    private fun scoreAway(token: ContextToken): Candidate {
+        var score = 0
+        val reasons = mutableListOf<String>()
+        if (token.isDeviceLocked) {
+            score += 3
+            reasons += "phone locked"
+        }
+        if (token.isCharging) {
+            score += 2
+            reasons += "charging"
+        }
+        if (token.devicePlace == DevicePlace.ChargingStand || token.devicePlace == DevicePlace.FaceDown) {
+            score += 1
+            reasons += "phone set aside"
+        }
+        return Candidate(
+            label = "Away",
+            intent = "Nishant appears away from his phone.",
+            returnText = "He'll respond when he picks it back up.",
+            returnMinutes = 30,
+            rawScore = score,
+            reasons = reasons,
         )
     }
 
@@ -54,6 +80,9 @@ class StillEngine {
     private fun scoreMeditating(token: ContextToken): Candidate {
         var score = 0
         val reasons = mutableListOf<String>()
+        if (token.devicePlace == DevicePlace.InHand) {
+            score -= 2
+        }
         if (token.motion == MotionState.Still) {
             score += 1
             reasons += "still body"
@@ -86,6 +115,9 @@ class StillEngine {
         if (token.motion == MotionState.HighMotion || token.motion == MotionState.MicroVibration) {
             score += 2
             reasons += "vehicle-like vibration"
+        }
+        if (token.sessionSteps >= 20) {
+            score -= 2
         }
         if (token.peripheral == Peripheral.CarBluetooth) {
             score += 2
@@ -124,6 +156,10 @@ class StillEngine {
             score += 1
             reasons += "headphones connected"
         }
+        if (token.sessionSteps >= 20) {
+            score += 1
+            reasons += "recent steps"
+        }
         return Candidate(
             label = "Deep work",
             intent = "Nishant is likely in deep work.",
@@ -137,8 +173,8 @@ class StillEngine {
     private fun scoreAvailable(token: ContextToken): Candidate {
         var score = 1
         val reasons = mutableListOf("fallback state")
-        if (token.motion == MotionState.Still && token.devicePlace == DevicePlace.InHand) {
-            score += 2
+        if (token.devicePlace == DevicePlace.InHand && !token.isDeviceLocked) {
+            score += 4
             reasons += "phone in hand"
         }
         if (token.physioStress == PhysioStress.Resting && token.ambientAudio != EnviroDecibel.Chaotic) {
